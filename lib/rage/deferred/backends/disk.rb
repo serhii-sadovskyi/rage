@@ -10,8 +10,16 @@ require "zlib"
 # * `remove_task` - called when a task has to be removed from the storage;
 # * `pending_tasks` - the method should iterate over the underlying storage and return a list of tasks to replay;
 # * `add_dead_task` - called when a task has exhausted its retries or aborted them;
-# * `list_dead_tasks` - return a list of dead tasks, newest first;
-# * `find_dead_task` - return a single dead task;
+# * `each_dead_task` - yield every dead task, oldest first, one at a time; for an id that is stored more than once,
+#   only the newest task; the set of dead tasks is fixed when the call starts, and no lock of the storage is held
+#   while a task is yielded;
+#   each dead task is a Hash with the keys `id`, `task_class`, `attempts`, `enqueued_at`, `failed_at`,
+#   `exception_class`, `exception_message`, `backtrace`, and `context`, where `context` is `Marshal.dump` of the
+#   `Rage::Deferred::Context` Array;
+# * `list_dead_tasks` - return a list of dead tasks as the same Hashes, newest first; for an id that is stored
+#   more than once, the newest task;
+# * `find_dead_task` - return a single dead task as the same Hash, or `nil` if there is no such task; for an id
+#   that is stored more than once, the newest task;
 # * `remove_dead_tasks` - permanently delete dead tasks;
 #
 class Rage::Deferred::Backends::Disk
@@ -51,6 +59,14 @@ class Rage::Deferred::Backends::Disk
   # @raise [Rage::Deferred::DeadTasksLockTimeout] if the dead-tasks store cannot be locked
   def add_dead_task(task_id, context, exception, task_class:, attempts:)
     @dead_tasks_storage.add(task_id, context, exception, task_class:, attempts:)
+  end
+
+  # Yield every dead-lettered task, oldest first, one record at a time.
+  # @yieldparam record [Hash] the same Hash that `find_dead_task` returns
+  # @return [void]
+  # @raise [Rage::Deferred::DeadTasksLockTimeout] if the dead-tasks store cannot be locked
+  def each_dead_task(&)
+    @dead_tasks_storage.each(&)
   end
 
   # Return a list of dead-lettered tasks, newest first.
@@ -352,8 +368,10 @@ class Rage::Deferred::Backends::Disk
   # Stores tasks that exhausted or aborted their retries so they can be inspected or replayed.
   #
   # All workers and processes share one append-only file. An exclusive, non-blocking file lock
-  # serializes access; lock acquisition is retried briefly before an operation fails. Deletions
-  # replace the file atomically, so a crash cannot leave a partially rewritten store.
+  # serializes access; lock acquisition is retried briefly before an operation fails. `each` and
+  # `find` hold the lock only to open the file and to note where its last complete entry ends; they
+  # read after the lock is released. Deletions replace the file atomically, so a crash cannot leave
+  # a partially rewritten store.
   #
   # @private
   class DeadTasksStorage
@@ -434,12 +452,54 @@ class Rage::Deferred::Backends::Disk
       records
     end
 
+    # Yield dead task records, oldest first, one at a time. For a task id that is stored more than
+    # once, only the latest entry is yielded. The set of records is fixed when the call starts, and
+    # the store is not locked while a record is yielded.
+    # @yieldparam record [Hash] task record
+    # @return [nil]
+    # @raise [Rage::Deferred::DeadTasksLockTimeout] if the store cannot be locked
+    def each
+      with_snapshot do |storage, limit|
+        index = {}
+
+        each_entry(storage, limit) do |id, _, position|
+          # a repeated id moves to the place of its newest entry
+          index.delete(id)
+          index[id] = position
+        end
+
+        # the ids are not needed any more; keep one Integer per record
+        positions = index.values
+        index = nil
+
+        next_position = nil
+
+        positions.each do |position|
+          # a seek drops the read buffer, so it is made only to jump over a skipped entry
+          storage.seek(position) if position != next_position
+          entry = storage.gets
+          next_position = position + entry.bytesize
+          entry.chomp!
+          record = decode_entry(entry)
+
+          yield record if record
+        end
+      end
+
+      nil
+    end
+
     # Find a dead task by its id.
     # @param id [String] persisted task id
     # @return [Hash, nil] the task record, or nil when no record matches
     # @raise [Rage::Deferred::DeadTasksLockTimeout] if the store cannot be locked
     def find(id)
-      read_records.find { |record| record[:id] == id }
+      with_snapshot do |storage, limit|
+        found = nil
+        each_entry(storage, limit) { |entry_id, entry| found = entry if entry_id == id }
+
+        decode_entry(found) if found
+      end
     end
 
     # Permanently delete the records with the given ids.
@@ -499,15 +559,22 @@ class Rage::Deferred::Backends::Disk
     # @param storage [File] store opened for reading and writing
     # @return [void]
     def repair_torn_tail(storage)
+      size = complete_size(storage)
+      storage.truncate(size) if size < storage.size
+    end
+
+    # Find the position just after the last complete entry of the store.
+    # @param storage [File] store opened for reading
+    # @return [Integer] the file size, or a smaller position if an interrupted append left an incomplete final entry
+    def complete_size(storage)
       storage.seek(0, IO::SEEK_END)
       end_position = storage.pos
-      return if end_position == 0
+      return 0 if end_position == 0
 
       storage.seek(-1, IO::SEEK_END)
-      return if storage.read(1) == "\n"
+      return end_position if storage.read(1) == "\n"
 
       position = end_position
-      truncate_at = 0
 
       while position > 0
         chunk_start = [position - TAIL_SCAN_CHUNK_SIZE, 0].max
@@ -515,14 +582,80 @@ class Rage::Deferred::Backends::Disk
         chunk = storage.read(position - chunk_start)
 
         if (newline_index = chunk.rindex("\n"))
-          truncate_at = chunk_start + newline_index + 1
-          break
+          return chunk_start + newline_index + 1
         end
 
         position = chunk_start
       end
 
-      storage.truncate(truncate_at)
+      0
+    end
+
+    # Fix the set of records for a read: open the live file and note where its last complete entry ends.
+    # The lock is held only for this; the block runs after the lock is released.
+    # @yieldparam storage [File] store opened for reading
+    # @yieldparam limit [Integer] position at which the read must stop
+    # @return [Object] the block result
+    # @raise [Rage::Deferred::DeadTasksLockTimeout] if the store cannot be locked
+    def with_snapshot
+      storage = nil
+
+      limit = with_lock("read tasks from") do
+        storage = File.open(@storage_path, File::RDONLY | File::BINARY)
+        complete_size(storage)
+      end
+
+      yield storage, limit
+    ensure
+      storage&.close
+    end
+
+    # Make one pass over the fixed set of records. Corrupted entries are reported and skipped.
+    # @param storage [File] store opened for reading
+    # @param limit [Integer] position at which the read must stop
+    # @yieldparam id [String] task id of the entry
+    # @yieldparam entry [String] serialized entry without its newline
+    # @yieldparam position [Integer] byte position at which the entry starts
+    # @return [nil]
+    def each_entry(storage, limit)
+      corrupted_count = 0
+      storage.rewind
+      position = 0
+
+      while position < limit
+        entry = storage.gets
+        break if entry.nil?
+
+        # the position is counted here: `IO#pos` drops the read buffer
+        next_position = position + entry.bytesize
+        entry.chomp!
+        id = entry_id(entry)
+
+        if id.nil?
+          corrupted_count += 1
+        else
+          yield id, entry, position
+        end
+
+        position = next_position
+      end
+
+      if corrupted_count != 0
+        puts "WARNING: Detected #{corrupted_count} corrupted dead-lettered task(s)"
+      end
+
+      nil
+    end
+
+    # Decode the task record of one stored entry. A record that cannot be decoded is reported.
+    # @param entry [String] serialized entry without its newline
+    # @return [Hash, nil] the task record, or nil if it cannot be decoded
+    def decode_entry(entry)
+      _, _, id, serialized_record = entry.split(":", 4)
+      Marshal.load(serialized_record.undump)
+    rescue ArgumentError, NameError, TypeError => e
+      puts "ERROR: Can't deserialize the dead-lettered task with id #{id}: (#{e.class}) #{e.message}"
+      nil
     end
 
     # Read valid records, keeping only the latest entry for each task id.

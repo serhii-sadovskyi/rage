@@ -557,6 +557,232 @@ RSpec.describe Rage::Deferred::Backends::Disk do
       end
     end
 
+    describe "#each_dead_task" do
+      it "yields the record Hashes of three dead tasks, oldest first" do
+        add_dead_task("1-1-1")
+        add_dead_task("2-2-2")
+        add_dead_task("3-3-3")
+        records = []
+
+        backend.each_dead_task { |record| records << record }
+
+        expect(records.map { |record| record[:id] }).to eq(["1-1-1", "2-2-2", "3-3-3"])
+        expect(records).to all(be_a(Hash))
+      end
+
+      it "yields Hashes with the contract keys and an undecoded context String" do
+        add_dead_task("1-1-1")
+        records = []
+
+        backend.each_dead_task { |record| records << record }
+
+        expect(records.map { |record| record.keys.sort }).to eq([
+          %i[attempts backtrace context enqueued_at exception_class exception_message failed_at id task_class]
+        ])
+        expect(records.map { |record| record[:context] }).to eq([Marshal.dump(context)])
+      end
+
+      it "does not yield a task added inside the block" do
+        add_dead_task("1-1-1")
+        add_dead_task("2-2-2")
+        yielded = []
+
+        backend.each_dead_task do |record|
+          add_dead_task("3-3-3") if yielded.empty?
+          yielded << record[:id]
+        end
+
+        expect(yielded).to eq(["1-1-1", "2-2-2"])
+        expect(stored_entries.map { |entry| entry[:id] }).to eq(["1-1-1", "2-2-2", "3-3-3"])
+      end
+
+      it "still yields a task removed inside the block before it was yielded" do
+        add_dead_task("1-1-1")
+        add_dead_task("2-2-2")
+        add_dead_task("3-3-3")
+        yielded = []
+
+        backend.each_dead_task do |record|
+          backend.remove_dead_tasks("3-3-3") if yielded.empty?
+          yielded << record[:id]
+        end
+
+        expect(yielded).to eq(["1-1-1", "2-2-2", "3-3-3"])
+        expect(stored_entries.map { |entry| entry[:id] }).to eq(["1-1-1", "2-2-2"])
+      end
+
+      it "lets remove_dead_tasks inside the block return the removed count" do
+        add_dead_task("1-1-1")
+        add_dead_task("2-2-2")
+        removed = []
+
+        backend.each_dead_task { |record| removed << backend.remove_dead_tasks(record[:id]) }
+
+        expect(removed).to eq([1, 1])
+      end
+
+      it "yields only the last written record of a repeated id" do
+        add_dead_task("1-1-1", RuntimeError.new("first"))
+        add_dead_task("1-1-1", RuntimeError.new("second"))
+        records = []
+
+        backend.each_dead_task { |record| records << record }
+
+        expect(records.map { |record| [record[:id], record[:exception_message]] }).to eq([["1-1-1", "second"]])
+      end
+
+      it "yields a repeated id at the place of its last written record" do
+        add_dead_task("1-1-1", RuntimeError.new("first"))
+        add_dead_task("2-2-2")
+        add_dead_task("1-1-1", RuntimeError.new("second"))
+        records = []
+
+        backend.each_dead_task { |record| records << record }
+
+        expect(records.map { |record| [record[:id], record[:exception_message]] }).to eq(
+          [["2-2-2", "boom"], ["1-1-1", "second"]]
+        )
+      end
+
+      it "does not yield a shorter task written over an incomplete final entry inside the block" do
+        add_dead_task("1-1-1")
+        add_dead_task("2-2-2")
+        dead_tasks_path.open("ab") { |storage| storage.write("\x01" * 20_000) }
+        yielded = []
+
+        # the incomplete entry is outside the set of records, so it is not reported as corrupted
+        expect {
+          backend.each_dead_task do |record|
+            add_dead_task("3-3-3") if yielded.empty?
+            yielded << record[:id]
+          end
+        }.not_to output.to_stdout
+
+        expect(yielded).to eq(["1-1-1", "2-2-2"])
+        expect(stored_entries.map { |entry| entry[:id] }).to eq(["1-1-1", "2-2-2", "3-3-3"])
+      end
+
+      it "raises before the block is called when the store cannot be locked" do
+        stub_const("#{described_class}::DeadTasksStorage::LOCK_MAX_ATTEMPTS", 1)
+        add_dead_task("1-1-1")
+        holder = File.open(lock_path, File::WRONLY)
+        holder.flock(File::LOCK_EX)
+        yielded = []
+
+        begin
+          expect {
+            backend.each_dead_task { |record| yielded << record[:id] }
+          }.to raise_error(Rage::Deferred::DeadTasksLockTimeout, /read tasks from/)
+          expect(yielded).to eq([])
+        ensure
+          holder.flock(File::LOCK_UN)
+          holder.close
+        end
+      end
+
+      it "skips a line that fails its checksum and yields the records around it" do
+        add_dead_task("1-1-1")
+        dead_tasks_path.open("ab") { |storage| storage.write("deadbeef:dead_task:9-9-9:garbage\n") }
+        add_dead_task("2-2-2")
+        yielded = []
+
+        expect {
+          backend.each_dead_task { |record| yielded << record[:id] }
+        }.to output("WARNING: Detected 1 corrupted dead-lettered task(s)\n").to_stdout
+
+        expect(yielded).to eq(["1-1-1", "2-2-2"])
+      end
+
+      it "yields nothing for a final entry without a newline" do
+        add_dead_task("1-1-1")
+        add_dead_task("2-2-2")
+        dead_tasks_path.open("ab") { |storage| storage.write("deadbeef:dead_task:partial") }
+        bytes = dead_tasks_path.binread
+        yielded = []
+
+        expect {
+          backend.each_dead_task { |record| yielded << record[:id] }
+        }.not_to output.to_stdout
+
+        expect(yielded).to eq(["1-1-1", "2-2-2"])
+        expect(dead_tasks_path.binread).to eq(bytes)
+      end
+
+      it "yields nothing for a final entry that is complete except for its newline" do
+        add_dead_task("1-1-1")
+        add_dead_task("2-2-2")
+        add_dead_task("3-3-3")
+        dead_tasks_path.truncate(dead_tasks_path.size - 1)
+        bytes = dead_tasks_path.binread
+        yielded = []
+
+        expect {
+          backend.each_dead_task { |record| yielded << record[:id] }
+        }.not_to output.to_stdout
+
+        expect(yielded).to eq(["1-1-1", "2-2-2"])
+        expect(dead_tasks_path.binread).to eq(bytes)
+      end
+
+      context "when the block does not run to the end" do
+        def open_store_files
+          ObjectSpace.each_object(File).select { |file| !file.closed? && file.path == dead_tasks_path.to_s }
+        end
+
+        before do
+          add_dead_task("1-1-1")
+          add_dead_task("2-2-2")
+        end
+
+        it "closes the file and passes the error on when the block raises" do
+          expect {
+            backend.each_dead_task { raise IOError, "from the block" }
+          }.to raise_error(IOError, "from the block")
+
+          expect(open_store_files).to eq([])
+        end
+
+        it "closes the file when the block ends the call with break" do
+          yielded = []
+
+          backend.each_dead_task do |record|
+            yielded << record[:id]
+            break
+          end
+
+          expect(yielded).to eq(["1-1-1"])
+          expect(open_store_files).to eq([])
+        end
+      end
+    end
+
+    describe "#find_dead_task" do
+      it "returns the record Hash of a stored id" do
+        add_dead_task("1-1-1")
+        add_dead_task("2-2-2")
+
+        record = backend.find_dead_task("1-1-1")
+
+        expect(record).to be_a(Hash)
+        expect(record[:id]).to eq("1-1-1")
+        expect(record[:context]).to eq(Marshal.dump(context))
+      end
+
+      it "returns the last written record of a repeated id" do
+        add_dead_task("1-1-1", RuntimeError.new("first"))
+        add_dead_task("2-2-2")
+        add_dead_task("1-1-1", RuntimeError.new("second"))
+
+        expect(backend.find_dead_task("1-1-1")[:exception_message]).to eq("second")
+      end
+
+      it "returns nil for an id that is not in the store" do
+        add_dead_task("1-1-1")
+
+        expect(backend.find_dead_task("absent")).to be_nil
+      end
+    end
+
     it "shares one store across two backend instances" do
       other = described_class.new(path: storage_path, prefix: prefix, fsync_frequency: fsync_frequency)
 
