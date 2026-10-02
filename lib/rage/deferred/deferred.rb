@@ -51,6 +51,18 @@ module Rage::Deferred
     Rage::Deferred::Proxy.new(instance, delay:, delay_until:)
   end
 
+  # Get the collection of dead tasks: tasks that used up or aborted their retries.
+  # @return [Rage::Deferred::DeadTasks] the same object on every call
+  # @example List dead tasks
+  #   Rage::Deferred.dead_tasks.each do |task|
+  #     puts "#{task.task_class}: #{task.exception_message}"
+  #   end
+  # @example Find a dead task
+  #   Rage::Deferred.dead_tasks.find_by_id("1759312800-4242-7")
+  def self.dead_tasks
+    @__dead_tasks ||= Rage::Deferred::DeadTasks.new(__backend)
+  end
+
   # @private
   def self.__backend
     @__backend ||= Rage.config.deferred.backend
@@ -111,6 +123,8 @@ require_relative "queue"
 require_relative "proxy"
 require_relative "context"
 require_relative "metadata"
+require_relative "dead_tasks"
+require_relative "dead_task"
 require_relative "middleware_chain"
 require_relative "backends/disk"
 require_relative "backends/nil"

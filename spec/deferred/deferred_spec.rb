@@ -68,6 +68,35 @@ RSpec.describe Rage::Deferred do
     end
   end
 
+  describe ".dead_tasks" do
+    let(:storage_path) { Pathname.new(Dir.mktmpdir) }
+    let(:backend) { Rage::Deferred::Backends::Disk.new(path: storage_path, prefix: "test_prefix", fsync_frequency: 100) }
+
+    before do
+      Rage::Deferred.instance_variable_set(:@__dead_tasks, nil)
+      allow(Rage::Deferred).to receive(:__backend).and_return(backend)
+    end
+
+    after do
+      Rage::Deferred.instance_variable_set(:@__dead_tasks, nil)
+      FileUtils.remove_entry(storage_path)
+    end
+
+    it "yields a DeadTask with the id of a stored dead task" do
+      backend.add_dead_task("1-1-1", ["SendWelcomeEmail", nil, nil, 0], RuntimeError.new("boom"), task_class: "SendWelcomeEmail", attempts: 3)
+      yielded = []
+
+      described_class.dead_tasks.each { |task| yielded << task }
+
+      expect(yielded.map { |task| [task.class, task.id] }).to eq([[Rage::Deferred::DeadTask, "1-1-1"]])
+    end
+
+    it "returns the same object on every call" do
+      expect(described_class.dead_tasks).to be_a(Rage::Deferred::DeadTasks)
+      expect(described_class.dead_tasks).to equal(described_class.dead_tasks)
+    end
+  end
+
   describe ".__middleware_chain" do
     before do
       Rage::Deferred.instance_variable_set(:@__middleware_chain, nil)
